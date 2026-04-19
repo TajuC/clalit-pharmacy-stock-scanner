@@ -1,0 +1,31 @@
+{
+  "name": "pharmacy-stock-automation",
+  "version": "1.0.0",
+  "description": "Automated stock scanner for Clalit pharmacy medicine availability across Israeli localities",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "node src/main.js",
+    "scan": "node src/main.js",
+    "scan:headed": "node src/main.js --headed",
+    "scan:debug": "node src/main.js --headed --slowMo=120",
+    "dashboard": "node src/dashboard.js",
+    "dashboard:open": "powershell -NoProfile -Command \"Start-Process 'http://localhost:8787'\""
+  },
+  "keywords": [
+    "playwright",
+    "automation",
+    "pharmacy",
+    "clalit",
+    "stock"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "dotenv": "^16.5.0",
+    "p-limit": "^6.2.0",
+    "playwright": "^1.53.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

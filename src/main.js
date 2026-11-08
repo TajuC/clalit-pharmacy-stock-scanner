@@ -5,11 +5,12 @@ require('dotenv').config();
 const fs = require('node:fs/promises');
 const path = require('node:path');
 const pLimit = require('p-limit').default;
+const { launchSession, ScanAbortedError, STOCK_CAPTCHA_ACTION } = require('./browser');
+const { loadCityIndex, saveCityIndex, planCities } = require('./city-index');
 
-const BASE_URL = 'https://e-services.clalit.co.il/PharmacyStockCoreAPI';
-const SEARCH_BASE = `${BASE_URL}/Search`;
-const API_BASE = `${BASE_URL}/api`;
+const DEFAULT_TARGET_URL = 'https://e-services.clalit.co.il/PharmacyStock/';
 const ASHKELON_COORDS = { lat: 31.6693, lon: 34.5715 };
+const DEFAULT_INTERVAL_MS = 1500;
 
 function parseArgs(argv) {
   const result = {};
@@ -18,9 +19,14 @@ function parseArgs(argv) {
     if (!arg.startsWith('--')) {
       continue;
     }
+    const eq = arg.indexOf('=');
+    if (eq !== -1) {
+      result[arg.slice(2, eq)] = arg.slice(eq + 1);
+      continue;
+    }
     const key = arg.slice(2);
     const next = argv[i + 1];
-    if (!next || next.startsWith('--')) {
+    if (next === undefined || next.startsWith('--')) {
       result[key] = true;
       continue;
     }
@@ -33,6 +39,14 @@ function parseArgs(argv) {
 function toInt(value, fallback) {
   const n = Number.parseInt(String(value ?? ''), 10);
   return Number.isFinite(n) ? n : fallback;
+}
+
+function toBool(value, fallback) {
+  if (value === true) return true;
+  const text = String(value ?? '').trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(text)) return true;
+  if (['0', 'false', 'no', 'off'].includes(text)) return false;
+  return fallback;
 }
 
 function nowStamp() {
@@ -50,6 +64,7 @@ function encodeBase64Utf8(value) {
 }
 
 function toNumber(value) {
+  if (value === null || value === undefined || value === '') return null;
   const n = Number(value);
   return Number.isFinite(n) ? n : null;
 }
@@ -77,6 +92,9 @@ function directionRelativeToAshkelon(lat) {
 }
 
 function htmlToText(value) {
+  if (Array.isArray(value)) {
+    return value.map(htmlToText).filter(Boolean).join(' ');
+  }
   return String(value ?? '')
     .replace(/<[^>]*>/g, ' ')
     .replace(/&nbsp;/gi, ' ')
@@ -103,69 +121,21 @@ function extractOpeningHours(instructionHtml, isOpenNow) {
   return '';
 }
 
-async function sleep(ms) {
+function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function postJson(url, body, timeoutMs, retries) {
-  let lastError = null;
-
-  for (let attempt = 0; attempt <= retries; attempt += 1) {
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), timeoutMs);
-
+async function withRetries(operation, retries) {
+  for (let attempt = 0; ; attempt += 1) {
     try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          referer: 'https://e-services.clalit.co.il/PharmacyStock/'
-        },
-        body: JSON.stringify(body),
-        signal: controller.signal
-      });
-
-      const contentType = response.headers.get('content-type') || '';
-      const text = await response.text();
-
-      if (!response.ok) {
-        throw new Error(`HTTP ${response.status} at ${url}`);
-      }
-
-      if (!contentType.toLowerCase().includes('application/json')) {
-        const snippet = text.slice(0, 120).replace(/\s+/g, ' ');
-        throw new Error(`Non-JSON response at ${url}: ${snippet}`);
-      }
-
-      return JSON.parse(text);
+      return await operation();
     } catch (error) {
-      lastError = error;
-      const isLastAttempt = attempt >= retries;
-      if (isLastAttempt) {
-        break;
+      if (error instanceof ScanAbortedError || !error.retryable || attempt >= retries) {
+        throw error;
       }
-
-      const delay = 400 * (attempt + 1) + Math.floor(Math.random() * 250);
-      await sleep(delay);
-    } finally {
-      clearTimeout(timer);
+      await sleep(600 * (attempt + 1) + Math.floor(Math.random() * 400));
     }
   }
-
-  throw lastError;
-}
-
-async function getAllCities(lang, timeoutMs, retries) {
-  return postJson(`${SEARCH_BASE}/GetAllCitiesList?lang=${encodeURIComponent(lang)}`, {}, timeoutMs, retries);
-}
-
-async function searchMedications(query, lang, timeoutMs, retries) {
-  return postJson(
-    `${SEARCH_BASE}/GetFilterefMedicationsList?lang=${encodeURIComponent(lang)}`,
-    { searchText: encodeBase64Utf8(query), isPrefix: true },
-    timeoutMs,
-    retries
-  );
 }
 
 function pickMedication(candidates, requestedName) {
@@ -189,8 +159,8 @@ function pickMedication(candidates, requestedName) {
   };
 }
 
-async function getStockByCity({ cityCode, medication, lang, timeoutMs, retries }) {
-  const body = {
+function stockRequestBody(cityCode, medication) {
+  return {
     medicationsList: [
       {
         catCode: medication.catCode,
@@ -207,13 +177,6 @@ async function getStockByCity({ cityCode, medication, lang, timeoutMs, retries }
     isGPSActive: false,
     cityCode
   };
-
-  return postJson(
-    `${API_BASE}/PharmacyStock/GetPharmacyStockByCityCode?lang=${encodeURIComponent(lang)}`,
-    body,
-    timeoutMs,
-    retries
-  );
 }
 
 function statusFromCode(code) {
@@ -224,15 +187,108 @@ function statusFromCode(code) {
   return 'unknown';
 }
 
+function cityRows({ city, checkedAt, data, selected }) {
+  const base = {
+    checkedAt,
+    cityCode: city.cityCode,
+    cityName: city.cityName,
+    hasAnyResult: false,
+    pharmaciesInCity: 0,
+    pharmacyName: '',
+    pharmacyCode: '',
+    pharmacyAddress: '',
+    pharmacyPhone: '',
+    isOpenNow: '',
+    openingHours: '',
+    latCoord: '',
+    lonCoord: '',
+    distanceFromAshkelonKm: '',
+    directionRelativeToAshkelon: '',
+    medicationName: selected.omryName,
+    medicationCode: selected.catCode,
+    stockCode: '',
+    availability: 'not_found'
+  };
+
+  const pharmacies = Array.isArray(data?.pharmaciesList) ? data.pharmaciesList : [];
+  const hasAnyResult = pharmacies.length > 0 && !data?.isEmptyResult;
+  if (!hasAnyResult) {
+    return { hasAnyResult, pharmaciesCount: pharmacies.length, rows: [base] };
+  }
+
+  const rows = [];
+  for (const pharmacy of pharmacies) {
+    const latCoord = toNumber(pharmacy.latCoord);
+    const lonCoord = toNumber(pharmacy.longCoord);
+    const hasCoords = Number.isFinite(latCoord) && Number.isFinite(lonCoord);
+    const pharmacyRow = {
+      ...base,
+      hasAnyResult: true,
+      pharmaciesInCity: pharmacies.length,
+      pharmacyName: pharmacy.pharmacyName,
+      pharmacyCode: pharmacy.pharmacyCode,
+      pharmacyAddress: htmlToText(pharmacy.pharmacyAdress),
+      pharmacyPhone: pharmacy.pharmacyPhone,
+      isOpenNow: pharmacy.ifOpenedNow,
+      openingHours: extractOpeningHours(pharmacy.pharmacyInstruction, pharmacy.ifOpenedNow),
+      latCoord: latCoord ?? '',
+      lonCoord: lonCoord ?? '',
+      distanceFromAshkelonKm: hasCoords
+        ? Number(haversineKm(ASHKELON_COORDS.lat, ASHKELON_COORDS.lon, latCoord, lonCoord).toFixed(2))
+        : '',
+      directionRelativeToAshkelon: directionRelativeToAshkelon(latCoord),
+      availability: 'unknown'
+    };
+
+    const meds = Array.isArray(pharmacy.medicationsList) ? pharmacy.medicationsList : [];
+    if (meds.length === 0) {
+      rows.push(pharmacyRow);
+      continue;
+    }
+    for (const med of meds) {
+      rows.push({
+        ...pharmacyRow,
+        medicationName: med.medicationName,
+        medicationCode: med.medicationCode,
+        stockCode: med.kodStatusMlay,
+        availability: statusFromCode(med.kodStatusMlay)
+      });
+    }
+  }
+  return { hasAnyResult, pharmaciesCount: pharmacies.length, rows };
+}
+
 function sanitizeCsv(value) {
   const text = String(value ?? '');
-  if (text.includes(',') || text.includes('"') || text.includes('\n')) {
+  if (/[",\r\n]/.test(text)) {
     return `"${text.replaceAll('"', '""')}"`;
   }
   return text;
 }
 
-async function writeOutputs({ outputDir, medicine, selectedMedication, citySummaries, rows }) {
+const CSV_COLUMNS = [
+  'checkedAt',
+  'cityCode',
+  'cityName',
+  'hasAnyResult',
+  'pharmaciesInCity',
+  'pharmacyName',
+  'pharmacyCode',
+  'pharmacyAddress',
+  'pharmacyPhone',
+  'isOpenNow',
+  'openingHours',
+  'latCoord',
+  'lonCoord',
+  'distanceFromAshkelonKm',
+  'directionRelativeToAshkelon',
+  'medicationName',
+  'medicationCode',
+  'stockCode',
+  'availability'
+];
+
+async function writeOutputs({ outputDir, medicine, selectedMedication, citySummaries, rows, citiesSkipped, partialReason }) {
   await fs.mkdir(outputDir, { recursive: true });
 
   const stamp = nowStamp();
@@ -244,10 +300,14 @@ async function writeOutputs({ outputDir, medicine, selectedMedication, citySumma
     generatedAt: new Date().toISOString(),
     medicineQuery: medicine,
     selectedMedication,
+    partial: Boolean(partialReason),
+    partialReason: partialReason || '',
     totals: {
       citiesChecked: citySummaries.length,
+      citiesSkipped,
       citiesWithResults: citySummaries.filter((x) => x.hasAnyResult).length,
-      pharmacyRows: rows.length
+      citiesFailed: citySummaries.filter((x) => x.error).length,
+      pharmacyRows: rows.filter((x) => x.pharmacyName).length
     },
     citySummaries,
     rows
@@ -255,83 +315,34 @@ async function writeOutputs({ outputDir, medicine, selectedMedication, citySumma
 
   await fs.writeFile(jsonPath, JSON.stringify(payload, null, 2), 'utf8');
 
-  const header = [
-    'checkedAt',
-    'cityCode',
-    'cityName',
-    'hasAnyResult',
-    'pharmaciesInCity',
-    'pharmacyName',
-    'pharmacyCode',
-    'pharmacyAddress',
-    'pharmacyPhone',
-    'isOpenNow',
-    'openingHours',
-    'latCoord',
-    'lonCoord',
-    'distanceFromAshkelonKm',
-    'directionRelativeToAshkelon',
-    'medicationName',
-    'medicationCode',
-    'stockCode',
-    'availability'
-  ];
-
-  const lines = [header.join(',')];
+  const lines = [CSV_COLUMNS.join(',')];
   for (const row of rows) {
-    lines.push(
-      [
-        row.checkedAt,
-        row.cityCode,
-        row.cityName,
-        row.hasAnyResult,
-        row.pharmaciesInCity,
-        row.pharmacyName,
-        row.pharmacyCode,
-        row.pharmacyAddress,
-        row.pharmacyPhone,
-        row.isOpenNow,
-        row.openingHours,
-        row.latCoord,
-        row.lonCoord,
-        row.distanceFromAshkelonKm,
-        row.directionRelativeToAshkelon,
-        row.medicationName,
-        row.medicationCode,
-        row.stockCode,
-        row.availability
-      ]
-        .map(sanitizeCsv)
-        .join(',')
-    );
+    lines.push(CSV_COLUMNS.map((column) => sanitizeCsv(row[column])).join(','));
   }
-
-  await fs.writeFile(csvPath, `${lines.join('\n')}\n`, 'utf8');
-  return { jsonPath, csvPath };
+  // Excel only detects UTF-8 (and renders Hebrew correctly) when the file starts with a BOM.
+  await fs.writeFile(csvPath, `﻿${lines.join('\r\n')}\r\n`, 'utf8');
+  return { jsonPath, csvPath, totals: payload.totals };
 }
 
-async function main() {
-  const args = parseArgs(process.argv.slice(2));
+function recordCity(index, city, result, checkedAt) {
+  const distances = result.rows.map((row) => row.distanceFromAshkelonKm).filter((d) => typeof d === 'number');
+  index.set(city.cityCode, {
+    cityName: city.cityName,
+    pharmacies: result.pharmaciesCount,
+    minDistanceKm: distances.length > 0 ? Math.min(...distances) : null,
+    checkedAt
+  });
+}
 
-  const medicine = args.medicine || process.env.MEDICINE_QUERY;
-  if (!medicine) {
-    throw new Error('Missing medicine query. Set MEDICINE_QUERY in .env or pass --medicine "VYVANSE 30MG"');
-  }
-
-  const lang = args.lang || process.env.APP_LANG || 'he-il';
-  const concurrency = Math.max(1, toInt(args.concurrency ?? process.env.CONCURRENCY, 6));
-  const maxCities = Math.max(0, toInt(args.maxCities ?? process.env.MAX_CITIES, 0));
-  const timeoutMs = Math.max(5000, toInt(args.timeoutMs ?? process.env.TIMEOUT_MS, 25000));
-  const retries = Math.max(0, toInt(args.retries ?? process.env.RETRIES, 2));
-  const cityCodeFilter = args.cityCode ? toInt(args.cityCode, -1) : -1;
-  const outputDir = path.resolve(process.cwd(), 'output');
-
-  console.log(`Scanning medicine: ${medicine}`);
-  console.log(`Config -> lang=${lang}, concurrency=${concurrency}, maxCities=${maxCities || 'all'}, timeoutMs=${timeoutMs}, retries=${retries}`);
+async function scan(session, config) {
+  const { medicine, concurrency, maxCities, retries, cityCodeFilter, indexFile, full, indexMaxAgeDays } = config;
 
   const [cities, medCandidates] = await Promise.all([
-    getAllCities(lang, timeoutMs, retries),
-    searchMedications(medicine, lang, timeoutMs, retries)
+    withRetries(() => session.request('Search/GetAllCitiesList', {}), retries),
+    withRetries(
+      () => session.request('Search/GetFilterefMedicationsList', { searchText: encodeBase64Utf8(medicine), isPrefix: true }),
+      retries
+    )
   ]);
 
   if (!Array.isArray(cities) || cities.length === 0) {
@@ -352,34 +363,61 @@ async function main() {
     console.log(`  ${idx + 1}. score=${entry.score} | ${entry.med.omryName} | catCode=${entry.med.catCode}`);
   });
 
-  let checkedCities = cityCodeFilter > -1 ? cities.filter((c) => c.cityCode === cityCodeFilter) : cities;
-  if (maxCities > 0) {
-    checkedCities = checkedCities.slice(0, maxCities);
-  }
+  const index = await loadCityIndex(indexFile);
+  const filtered = cityCodeFilter > -1 ? cities.filter((c) => c.cityCode === cityCodeFilter) : cities;
+  const plan = planCities(filtered, index, {
+    full: full || cityCodeFilter > -1,
+    maxAgeMs: indexMaxAgeDays * 24 * 60 * 60 * 1000
+  });
+  const checkedCities = maxCities > 0 ? plan.toScan.slice(0, maxCities) : plan.toScan;
   if (checkedCities.length === 0) {
     throw new Error(`No cities matched filters (cityCode=${cityCodeFilter > -1 ? cityCodeFilter : 'any'}, maxCities=${maxCities})`);
   }
-  console.log(`Cities to scan: ${checkedCities.length}`);
+  const unknown = checkedCities.filter((c) => !index.has(c.cityCode)).length;
+  console.log(
+    `Cities to scan: ${checkedCities.length}` +
+      (plan.skipped.length ? ` (skipping ${plan.skipped.length} known to have no pharmacies; --full rescans them)` : '') +
+      (unknown ? `, ${unknown} not yet in the city index` : '')
+  );
 
   const limit = pLimit(concurrency);
   const citySummaries = [];
   const rows = [];
+  let abortError = null;
   let completed = 0;
+  let unsaved = 0;
+
+  const persistIndex = () => saveCityIndex(indexFile, index).catch((error) => console.warn(`Could not save city index: ${error.message}`));
+
+  const reportProgress = () => {
+    completed += 1;
+    if (completed % 25 === 0 || completed === checkedCities.length) {
+      const failed = citySummaries.filter((x) => x.error).length;
+      console.log(`Progress: ${completed}/${checkedCities.length}${failed ? ` (${failed} failed)` : ''}`);
+    }
+  };
 
   await Promise.all(
     checkedCities.map((city) =>
       limit(async () => {
+        if (abortError) {
+          return;
+        }
         const checkedAt = new Date().toISOString();
         let data;
         try {
-          data = await getStockByCity({
-            cityCode: city.cityCode,
-            medication: selected,
-            lang,
-            timeoutMs,
+          data = await withRetries(
+            () =>
+              session.request('api/PharmacyStock/GetPharmacyStockByCityCode', stockRequestBody(city.cityCode, selected), {
+                captchaAction: STOCK_CAPTCHA_ACTION
+              }),
             retries
-          });
+          );
         } catch (error) {
+          if (error instanceof ScanAbortedError) {
+            abortError ??= error;
+            return;
+          }
           citySummaries.push({
             cityCode: city.cityCode,
             cityName: city.cityName,
@@ -387,135 +425,134 @@ async function main() {
             pharmaciesCount: 0,
             error: error.message
           });
-          completed += 1;
-          if (completed % 25 === 0 || completed === checkedCities.length) {
-            console.log(`Progress: ${completed}/${checkedCities.length}`);
-          }
+          reportProgress();
           return;
         }
 
-        const pharmacies = Array.isArray(data?.pharmaciesList) ? data.pharmaciesList : [];
-        const hasAnyResult = pharmacies.length > 0 && !data?.isEmptyResult;
+        const result = cityRows({ city, checkedAt, data, selected });
+        recordCity(index, city, result, checkedAt);
+        unsaved += 1;
+        if (unsaved >= 25) {
+          unsaved = 0;
+          await persistIndex();
+        }
         citySummaries.push({
           cityCode: city.cityCode,
           cityName: city.cityName,
-          hasAnyResult,
-          pharmaciesCount: pharmacies.length,
+          hasAnyResult: result.hasAnyResult,
+          pharmaciesCount: result.pharmaciesCount,
           isWsError: Boolean(data?.isWsError)
         });
-
-        if (!hasAnyResult) {
-          rows.push({
-            checkedAt,
-            cityCode: city.cityCode,
-            cityName: city.cityName,
-            hasAnyResult: false,
-            pharmaciesInCity: 0,
-            pharmacyName: '',
-            pharmacyCode: '',
-            pharmacyAddress: '',
-            pharmacyPhone: '',
-            isOpenNow: '',
-            openingHours: '',
-            latCoord: '',
-            lonCoord: '',
-            distanceFromAshkelonKm: '',
-            directionRelativeToAshkelon: '',
-            medicationName: selected.omryName,
-            medicationCode: selected.catCode,
-            stockCode: '',
-            availability: 'not_found'
-          });
-        } else {
-          for (const pharmacy of pharmacies) {
-            const latCoord = toNumber(pharmacy.latCoord);
-            const lonCoord = toNumber(pharmacy.longCoord);
-            const distanceFromAshkelonKm =
-              Number.isFinite(latCoord) && Number.isFinite(lonCoord)
-                ? Number(haversineKm(ASHKELON_COORDS.lat, ASHKELON_COORDS.lon, latCoord, lonCoord).toFixed(2))
-                : '';
-            const direction = directionRelativeToAshkelon(latCoord);
-            const openingHours = extractOpeningHours(pharmacy.pharmacyInstruction, pharmacy.ifOpenedNow);
-            const meds = Array.isArray(pharmacy.medicationsList) ? pharmacy.medicationsList : [];
-            if (meds.length === 0) {
-              rows.push({
-                checkedAt,
-                cityCode: city.cityCode,
-                cityName: city.cityName,
-                hasAnyResult: true,
-                pharmaciesInCity: pharmacies.length,
-                pharmacyName: pharmacy.pharmacyName,
-                pharmacyCode: pharmacy.pharmacyCode,
-                pharmacyAddress: pharmacy.pharmacyAdress,
-                pharmacyPhone: pharmacy.pharmacyPhone,
-                isOpenNow: pharmacy.ifOpenedNow,
-                openingHours,
-                latCoord,
-                lonCoord,
-                distanceFromAshkelonKm,
-                directionRelativeToAshkelon: direction,
-                medicationName: selected.omryName,
-                medicationCode: selected.catCode,
-                stockCode: '',
-                availability: 'unknown'
-              });
-              continue;
-            }
-
-            for (const med of meds) {
-              rows.push({
-                checkedAt,
-                cityCode: city.cityCode,
-                cityName: city.cityName,
-                hasAnyResult: true,
-                pharmaciesInCity: pharmacies.length,
-                pharmacyName: pharmacy.pharmacyName,
-                pharmacyCode: pharmacy.pharmacyCode,
-                pharmacyAddress: pharmacy.pharmacyAdress,
-                pharmacyPhone: pharmacy.pharmacyPhone,
-                isOpenNow: pharmacy.ifOpenedNow,
-                openingHours,
-                latCoord,
-                lonCoord,
-                distanceFromAshkelonKm,
-                directionRelativeToAshkelon: direction,
-                medicationName: med.medicationName,
-                medicationCode: med.medicationCode,
-                stockCode: med.kodStatusMlay,
-                availability: statusFromCode(med.kodStatusMlay)
-              });
-            }
-          }
-        }
-
-        completed += 1;
-        if (completed % 25 === 0 || completed === checkedCities.length) {
-          console.log(`Progress: ${completed}/${checkedCities.length}`);
-        }
+        rows.push(...result.rows);
+        reportProgress();
       })
     )
   );
 
+  await persistIndex();
   citySummaries.sort((a, b) => a.cityCode - b.cityCode);
+  return {
+    selected,
+    citySummaries,
+    rows,
+    citiesSkipped: plan.skipped.length,
+    partialReason: abortError ? `${abortError.message} Stopped after ${completed} of ${checkedCities.length} cities.` : ''
+  };
+}
 
-  const { jsonPath, csvPath } = await writeOutputs({
+async function main() {
+  const args = parseArgs(process.argv.slice(2));
+
+  const medicine = args.medicine || process.env.MEDICINE_QUERY;
+  if (!medicine || medicine === true) {
+    throw new Error('Missing medicine query. Set MEDICINE_QUERY in .env or pass --medicine "VYVANSE 30MG"');
+  }
+
+  const config = {
+    medicine,
+    lang: args.lang || process.env.APP_LANG || 'he-il',
+    targetUrl: process.env.TARGET_URL || DEFAULT_TARGET_URL,
+    concurrency: Math.max(1, toInt(args.concurrency ?? process.env.CONCURRENCY, 2)),
+    maxCities: Math.max(0, toInt(args.maxCities ?? process.env.MAX_CITIES, 0)),
+    timeoutMs: Math.max(5000, toInt(args.timeoutMs ?? process.env.TIMEOUT_MS, 25000)),
+    retries: Math.max(0, toInt(args.retries ?? process.env.RETRIES, 2)),
+    cityCodeFilter: args.cityCode ? toInt(args.cityCode, -1) : -1,
+    headed: toBool(args.headed ?? process.env.SHOW_BROWSER, false),
+    slowMo: Math.max(0, toInt(args.slowMo ?? process.env.SLOW_MO, 0)),
+    browserPath: (typeof args.browserPath === 'string' && args.browserPath) || process.env.BROWSER_PATH || '',
+    intervalMs: Math.max(0, toInt(args.intervalMs ?? process.env.REQUEST_INTERVAL_MS, DEFAULT_INTERVAL_MS)),
+    stallMs: Math.max(1, toInt(args.stallMinutes ?? process.env.STALL_MINUTES, 5)) * 60 * 1000,
+    full: toBool(args.full, false),
+    indexMaxAgeDays: Math.max(0, toInt(args.indexMaxAgeDays ?? process.env.INDEX_MAX_AGE_DAYS, 30)),
+    onCooldown: (pauseMs) => console.warn(`The service rejected a request; pausing verified requests for ${Math.round(pauseMs / 1000)}s.`)
+  };
+  const outputDir = path.resolve(process.cwd(), 'output');
+  config.indexFile = path.join(outputDir, 'city-index.json');
+
+  console.log(`Scanning medicine: ${medicine}`);
+  console.log(
+    `Config -> lang=${config.lang}, concurrency=${config.concurrency}, intervalMs=${config.intervalMs}, maxCities=${config.maxCities || 'all'}, timeoutMs=${config.timeoutMs}, retries=${config.retries}`
+  );
+
+  const session = await launchSession(config);
+  console.log(`Browser: ${session.executable}${config.headed ? '' : ' (minimized)'}`);
+  if (session.recaptchaActive) {
+    console.log('Stock requests are verified by reCAPTCHA; keep the browser window open until the scan finishes.');
+  }
+
+  const onSignal = () => {
+    console.error('Interrupted, closing browser...');
+    session.close().finally(() => process.exit(130));
+  };
+  process.once('SIGINT', onSignal);
+  process.once('SIGTERM', onSignal);
+
+  let result;
+  try {
+    result = await scan(session, config);
+  } finally {
+    await session.close();
+    process.off('SIGINT', onSignal);
+    process.off('SIGTERM', onSignal);
+  }
+
+  const { selected, citySummaries, rows, citiesSkipped, partialReason } = result;
+  const failed = citySummaries.filter((x) => x.error);
+  if (failed.length === citySummaries.length) {
+    const reason = partialReason || (failed[0] ? `First error: ${failed[0].error}` : '');
+    throw new Error(`No city could be checked; no output written. ${reason}`.trim());
+  }
+
+  const { jsonPath, csvPath, totals } = await writeOutputs({
     outputDir,
     medicine,
     selectedMedication: selected,
     citySummaries,
-    rows
+    rows,
+    citiesSkipped,
+    partialReason
   });
 
-  const citiesWithResults = citySummaries.filter((x) => x.hasAnyResult).length;
-  console.log('--- Scan Completed ---');
-  console.log(`Cities checked: ${citySummaries.length}`);
-  console.log(`Cities with results: ${citiesWithResults}`);
-  console.log(`Rows written: ${rows.length}`);
+  console.log(partialReason ? '--- Scan Stopped Early ---' : '--- Scan Completed ---');
+  console.log(`Cities checked: ${totals.citiesChecked}${citiesSkipped ? ` (${citiesSkipped} skipped via city index)` : ''}`);
+  console.log(`Cities with results: ${totals.citiesWithResults}`);
+  console.log(`Pharmacy rows: ${totals.pharmacyRows}`);
+  if (totals.citiesFailed > 0) {
+    console.warn(`Cities failed: ${totals.citiesFailed} (see citySummaries[].error in the JSON). First error: ${failed[0].error}`);
+  }
   console.log(`JSON: ${jsonPath}`);
   console.log(`CSV: ${csvPath}`);
+  if (partialReason) {
+    console.warn(`PARTIAL SCAN: ${partialReason} Run the scan again later; cities already indexed are scanned first.`);
+    process.exitCode = 2;
+  }
 }
 
-main().catch((error) => {
-  console.error('Scan failed:', error.message);
-  process.exit(1);
-});
+if (require.main === module) {
+  main().catch((error) => {
+    console.error('Scan failed:', error.message);
+    process.exit(1);
+  });
+}
+
+module.exports = { parseArgs, toBool, htmlToText, extractOpeningHours, pickMedication, cityRows, sanitizeCsv, withRetries };

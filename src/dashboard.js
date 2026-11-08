@@ -4,6 +4,7 @@
 const http = require('node:http');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { spawn } = require('node:child_process');
 const ASHKELON_COORDS = { lat: 31.6693, lon: 34.5715 };
 
 function parsePort(argv) {
@@ -13,8 +14,26 @@ function parsePort(argv) {
   return Number.isFinite(value) ? value : 8787;
 }
 
+function openInBrowser(url) {
+  const [command, args] =
+    process.platform === 'win32'
+      ? ['cmd', ['/c', 'start', '""', url]]
+      : process.platform === 'darwin'
+        ? ['open', [url]]
+        : ['xdg-open', [url]];
+  const child = spawn(command, args, { stdio: 'ignore', detached: true, windowsHide: true });
+  child.on('error', () => console.log(`Open ${url} in your browser.`));
+  child.unref();
+}
+
 async function getLatestScan(outputDir) {
-  const entries = await fs.readdir(outputDir, { withFileTypes: true });
+  let entries;
+  try {
+    entries = await fs.readdir(outputDir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === 'ENOENT') return null;
+    throw error;
+  }
   const files = entries
     .filter((entry) => entry.isFile() && /^scan-.*\.json$/i.test(entry.name))
     .map((entry) => entry.name);
@@ -129,6 +148,9 @@ function renderHtml(payload) {
     return String(a.pharmacyName).localeCompare(String(b.pharmacyName), 'he');
   });
   const totals = hasData ? payload.data.totals || {} : {};
+  const summaries = hasData && Array.isArray(payload.data.citySummaries) ? payload.data.citySummaries : [];
+  const citiesFailed = totals.citiesFailed ?? summaries.filter((x) => x.error).length;
+  const partialReason = hasData && payload.data.partial ? payload.data.partialReason || 'Scan stopped early.' : '';
   const generatedAt = hasData ? payload.data.generatedAt : '';
   const medicine = hasData ? payload.data.medicineQuery : '';
   const fileName = hasData ? payload.fileName : '';
@@ -203,6 +225,7 @@ function renderHtml(payload) {
     }
     .label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
     .value { margin-top: 5px; font-size: 34px; font-weight: 800; }
+    .value.bad { color: #b42318; }
     .toolbar {
       margin-top: 16px;
       display: grid;
@@ -298,6 +321,16 @@ function renderHtml(payload) {
     .pill.ok { background: var(--ok); }
     .pill.warn { background: var(--warn); }
     .pill.na { background: var(--na); }
+    .notice {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      border: 1px solid #f0b4ab;
+      background: #fff4f2;
+      color: #8a1c10;
+      font-size: 14px;
+      font-weight: 600;
+    }
     .empty {
       margin-top: 18px;
       padding: 16px;
@@ -324,12 +357,14 @@ function renderHtml(payload) {
       <h1 class="title">Pharmacy Stock Dashboard</h1>
       <div class="meta">Medicine: ${escapeHtml(medicine)} | Generated: ${escapeHtml(generatedAt)} | File: ${escapeHtml(fileName)}</div>
     </div>
+    ${partialReason ? `<div class="notice">Partial scan: ${escapeHtml(partialReason)}</div>` : ''}
 
     ${hasData ? `
     <div class="cards">
       <div class="card"><div class="label">Cities Checked</div><div class="value">${escapeHtml(totals.citiesChecked)}</div></div>
       <div class="card"><div class="label">Cities With Results</div><div class="value">${escapeHtml(totals.citiesWithResults)}</div></div>
       <div class="card"><div class="label">Rows With Medicine</div><div class="value">${escapeHtml(rows.length)}</div></div>
+      <div class="card"><div class="label">Cities Failed</div><div class="value${citiesFailed > 0 ? ' bad' : ''}">${escapeHtml(citiesFailed)}</div></div>
       <div class="card"><div class="label">Sorted From Hometown</div><div class="value">Ashkelon</div></div>
     </div>
 
@@ -368,7 +403,7 @@ function renderHtml(payload) {
         </tbody>
       </table>
     </div>
-    ` : `<div class="empty">No scan files found in output folder. Run a scan first with npm.cmd run scan</div>`}
+    ` : `<div class="empty">No scan files found in output folder. Run a scan first with npm run scan</div>`}
   </div>
   <script>
     function updateVisibleCount() {
@@ -457,8 +492,12 @@ async function startServer() {
   });
 
   server.listen(port, () => {
-    console.log(`Dashboard running at http://localhost:${port}`);
+    const url = `http://localhost:${port}`;
+    console.log(`Dashboard running at ${url}`);
     console.log('Press Ctrl+C to stop.');
+    if (process.argv.includes('--open')) {
+      openInBrowser(url);
+    }
   });
 }
 

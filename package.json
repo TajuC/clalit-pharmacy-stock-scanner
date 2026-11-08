@@ -9,10 +9,11 @@
     "scan:headed": "node src/main.js --headed",
     "scan:debug": "node src/main.js --headed --slowMo=120",
     "dashboard": "node src/dashboard.js",
-    "dashboard:open": "powershell -NoProfile -Command \"Start-Process 'http://localhost:8787'\""
+    "dashboard:open": "node src/dashboard.js --open",
+    "test": "node --test"
   },
   "keywords": [
-    "playwright",
+    "chrome-devtools-protocol",
     "automation",
     "pharmacy",
     "clalit",
@@ -23,7 +24,7 @@
   "dependencies": {
     "dotenv": "^16.5.0",
     "p-limit": "^6.2.0",
-    "playwright": "^1.53.0"
+    "playwright-core": "^1.65.0"
   },
   "engines": {
     "node": ">=20"
